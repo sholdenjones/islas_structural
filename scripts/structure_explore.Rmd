@@ -1,0 +1,9 @@
+Load .las files to start exploring how to calculate structural diversity metrics
+- from Eben's data
+
+working in LidR
+```{r}
+library(lidR)
+```
+
+load data

@@ -47,3 +47,11 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+.positai
+
+# Large geospatial/LiDAR files
+*.tif
+*.kml
+*.kmz
+*.las
+*.laz
