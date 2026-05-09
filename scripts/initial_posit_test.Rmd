@@ -1,0 +1,264 @@
+---
+title: "Initial Posit Assistant Test — CHM Structural Metrics"
+date: "2026-05-08"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+## Overview
+
+This document records an initial test using Posit Assistant to compute
+structural diversity metrics from a 25 cm canopy height model (CHM)
+for the G2 site (`G2_25cm_chm.tif`). It details which metrics were
+successfully computed, which required workarounds, and which failed.
+
+---
+
+## Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(lidR)
+library(terra)
+library(tidyverse)
+```
+
+---
+
+## Load & Inspect CHM
+
+```{r load-chm}
+chm_raw <- rast("../data/G2_25cm_chm.tif")
+chm_raw
+summary(values(chm_raw, na.rm = TRUE))
+```
+
+**Key findings from inspection:**
+
+- Resolution: 0.25 m × 0.25 m (25 cm)
+- Total cells: ~26.8 million (4470 × 5998)
+- ~56% of cells are `NaN` — the raster extent covers a large non-study area
+  (ocean, outside plot boundary, etc.)
+- Only ~11.75 million cells contain valid data
+- Minimum value is −11.88 m: negative values are noise artifacts from the
+  point cloud processing pipeline and need to be clamped to 0
+
+```{r clean-chm}
+# Clamp negative noise artifacts to 0
+chm <- clamp(chm_raw, lower = 0, values = TRUE)
+
+pixel_res  <- res(chm)[1]   # 0.25 m
+pixel_area <- pixel_res^2   # 0.0625 m²
+ht_thresh  <- 2             # canopy / gap height threshold (m)
+
+# Separate all valid pixels from canopy-only pixels
+vals        <- values(chm, na.rm = TRUE)
+canopy_vals <- vals[vals >= ht_thresh]
+
+cat("Valid pixels:", length(vals), "\n")
+cat("Canopy pixels (>= 2 m):", length(canopy_vals), "\n")
+```
+
+---
+
+## ✅ Metrics That Worked
+
+### Mean & Max Canopy Height
+
+Calculated from canopy pixels only (≥ 2 m), after clamping negatives to 0.
+
+```{r mean-max}
+mean_ht <- mean(canopy_vals)
+max_ht  <- max(canopy_vals)
+
+cat("Mean canopy height:", round(mean_ht, 2), "m\n")
+cat("Max canopy height: ", round(max_ht,  2), "m\n")
+```
+
+### Height Standard Deviation & Coefficient of Variation
+
+```{r sd-cv}
+sd_ht  <- sd(canopy_vals)
+cv_ht  <- sd_ht / mean_ht
+
+cat("Height SD:", round(sd_ht, 2), "m\n")
+cat("CV:       ", round(cv_ht, 3), "\n")
+```
+
+### Height Percentiles
+
+```{r percentiles}
+pctls <- quantile(canopy_vals, probs = c(0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99))
+round(pctls, 2)
+```
+
+### Canopy Cover & Gap Fraction
+
+Computed over all valid pixels (includes gaps below 2 m threshold).
+
+```{r cover-gap}
+canopy_cover <- mean(vals >= ht_thresh)
+gap_fraction <- 1 - canopy_cover
+
+cat("Canopy cover (>= 2 m):", round(canopy_cover, 3),
+    sprintf("(%.1f%%)\n", canopy_cover * 100))
+cat("Gap fraction:         ", round(gap_fraction, 3),
+    sprintf("(%.1f%%)\n", gap_fraction * 100))
+```
+
+### Canopy Rugosity
+
+Defined here as the standard deviation of CHM surface heights across
+canopy pixels — a simple measure of surface roughness.
+
+```{r rugosity}
+rugosity <- sd_ht
+cat("Canopy rugosity (SD):", round(rugosity, 4), "m\n")
+```
+
+### Foliage Height Diversity (FHD)
+
+Shannon entropy computed over 1 m height bins for canopy pixels. This is
+an approximation — true FHD is typically derived from LAD profiles from
+point cloud data, not a CHM. lidR's `entropy()` function was not used here
+because it requires raw point cloud z-values rather than CHM surface heights.
+
+```{r fhd}
+breaks     <- seq(ht_thresh, ceiling(max_ht) + 1, by = 1)
+bin_counts <- hist(canopy_vals, breaks = breaks, plot = FALSE)$counts
+bin_props  <- bin_counts[bin_counts > 0] / sum(bin_counts)
+fhd        <- -sum(bin_props * log(bin_props))
+
+cat("Foliage Height Diversity:", round(fhd, 4), "nats\n")
+```
+
+### Vertical Complexity Index (VCI)
+
+FHD normalised by `log(n_layers)` to scale between 0–1.
+
+```{r vci}
+vci <- fhd / log(length(bin_props))
+cat("Vertical Complexity Index:", round(vci, 4), "\n")
+```
+
+### Canopy Gap Size Distribution
+
+Gap pixels (< 2 m) identified as connected patches using `terra::patches()`.
+This worked correctly but was **slow** (~2–3 minutes) due to the raster size
+(~26.8M cells). Future runs should consider aggregating the raster or
+clipping to the study area first.
+
+```{r gap-dist, message=FALSE}
+gap_mask    <- ifel(chm < ht_thresh, 1, NA)
+gap_patches <- patches(gap_mask, directions = 8, zeroAsNA = TRUE)
+gap_freq    <- freq(gap_patches)
+gap_areas   <- sort(gap_freq$count * pixel_area)  # convert pixels → m²
+
+tibble(
+  n_gaps        = length(gap_areas),
+  mean_gap_m2   = round(mean(gap_areas),   2),
+  median_gap_m2 = round(median(gap_areas), 2),
+  max_gap_m2    = round(max(gap_areas),    2),
+  total_gap_m2  = round(sum(gap_areas),    2)
+)
+```
+
+The gap size distribution is highly right-skewed: median gap is a single
+pixel (0.06 m²), but there is one large gap of ~12,597 m² — likely the
+main non-forested area within the study boundary.
+
+---
+
+## ❌ Metrics That Failed
+
+### Rumple Index (`lidR::rumple_index()`)
+
+**Status: Failed — returned `NaN`**
+
+The `rumple_index()` function from lidR computes the ratio of 3D canopy
+surface area to 2D ground area using Jenness's algorithm for raster inputs
+(or Delaunay triangulation for point inputs).
+
+Three approaches were attempted:
+
+1. **SpatRaster input** — `rumple_index(chm)` → `NaN`
+2. **Matrix input** — `rumple_index(as.matrix(chm, wide = TRUE), res = pixel_res)` → blank/`NaN`
+3. **x, y, z vectors from a cropped area** — the crop accidentally landed
+   entirely within the NaN region (56% of the raster is NaN), returning 0
+   valid points
+
+The likely root cause is the large proportion of NaN cells. Extracting all
+valid x, y, z coordinates to compute via point triangulation was attempted
+but **crashed the R session** — converting 11.75M points to a data frame
+with `as.data.frame(chm, xy = TRUE, na.rm = TRUE)` was too memory-intensive.
+
+**Recommended fix for next session:**
+
+1. Clip the CHM to a valid bounding box first (remove the large NaN border)
+2. Either pass the clipped raster to `rumple_index()`, or sample a
+   manageable number of points:
+
+```r
+# Clip to valid extent, then compute
+valid_ext  <- ext(trim(chm))
+chm_clipped <- crop(chm, valid_ext)
+ri <- rumple_index(chm_clipped)
+```
+
+---
+
+## Summary Table
+
+```{r summary-table, echo=FALSE}
+tibble(
+  Metric                       = c(
+    "Mean canopy height",
+    "Max canopy height",
+    "Height SD",
+    "Coefficient of variation",
+    "P10 / P25 / P50 / P75 / P90",
+    "Canopy cover",
+    "Gap fraction",
+    "Canopy rugosity",
+    "Foliage Height Diversity",
+    "Vertical Complexity Index",
+    "Gap size distribution",
+    "Rumple index"
+  ),
+  Status                       = c(
+    "✅", "✅", "✅", "✅", "✅",
+    "✅", "✅", "✅", "✅", "✅",
+    "✅ (slow)", "❌ NaN"
+  ),
+  Value                        = c(
+    paste(round(mean_ht, 2), "m"),
+    paste(round(max_ht,  2), "m"),
+    paste(round(sd_ht,   2), "m"),
+    round(cv_ht, 3),
+    paste(round(pctls[c("10%","25%","50%","75%","90%")], 1), collapse = " / "),
+    sprintf("%.1f%%", canopy_cover * 100),
+    sprintf("%.1f%%", gap_fraction * 100),
+    paste(round(rugosity, 2), "m"),
+    round(fhd, 4),
+    round(vci, 4),
+    "See gap table above",
+    "NaN — see notes"
+  )
+) |>
+  knitr::kable()
+```
+
+---
+
+## Notes for Next Steps
+
+- **Clip CHM to valid extent** before any heavy raster operations —
+  the ~56% NaN border is causing failures and unnecessary computation.
+- **Rumple index** should work once the raster is clipped; test with
+  `terra::trim()` to remove the NaN border.
+- **True FHD / LAD profiles** require the raw point cloud (`.las`/`.laz`),
+  not just the CHM — the CHM-based FHD here is an approximation.
+- Consider **aggregating to 1 m resolution** before `patches()` to speed
+  up gap size distribution computation.
